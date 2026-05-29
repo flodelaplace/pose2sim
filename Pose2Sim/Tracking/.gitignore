@@ -1,0 +1,6 @@
+# Caches and Python bytecode
+__pycache__/
+*.pyc
+
+# Feature cache produced by _fine_tune_arcface.py (regenerable in ~5 min)
+_arcface_features_cache.npz

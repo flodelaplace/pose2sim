@@ -897,66 +897,96 @@ def validate_func(final_json, output_json=None, device='cuda:0',
                 continue
             if action == 'r':
                 # User painted some detections RED on the scrubber timeline.
-                # Reassign ALL red detections (possibly disjoint ranges -
-                # e.g. swap-back A,B,A,B,A) to a single picked target.
+                # If the reds form multiple TEMPORALLY DISJOINT runs (= gap
+                # > RUN_GAP_FRAMES between two reds), open one picker per
+                # run so the user can assign each run to a different
+                # target. Otherwise (one contiguous run) a single picker
+                # like before. Fixes the case "frames 100-200 should be P3,
+                # frames 500-700 should be S1" — previously both went to
+                # the same target.
+                RUN_GAP_FRAMES = 60   # 2 s @ 30 fps
                 red_indices = decision['red_indices']
                 if not red_indices:
                     logging.info(f"  {format_id(fid)}: aucune frame marquée "
                                  f"en rouge — rien à ré-assigner.")
                     continue
-                sub_items = [fid_items[j] for j in red_indices]
-                red_frames = {f for f, _ in sub_items}
-                by_now = detections_by_final(per_frame_dets)
-                ranked = rank_reassign_candidates(
-                    fid, sub_items, by_now, width, height, video_path,
-                    official_ids=official_ids)
-                if not ranked:
-                    logging.info(f"  {format_id(fid)}: pas de candidat pour "
-                                 f"les {len(red_indices)} frames rouges.")
-                    continue
-                cand = [(o, rep) for o, rep, _ov in ranked[:6]]
-                o_strip = sample_filmstrip(sub_items, 6)
-                fig2 = render_reassign(
-                    fid, o_strip, cand, cap,
-                    f"Ré-assigner {len(red_indices)} dets rouges de "
-                    f"{format_id(fid)}")
-                k2 = _wait_key(fig2, set('s q 0 n p t 1 2 3 4 5 6'.split()))
-                if k2 == 'q':
-                    quit_requested = True
-                    break
-                if k2 in ('s', '0', 'n', None):
-                    continue  # cancelled -> identity untouched
-                target = None
-                if k2 in ('p', 't'):
-                    # Create a NEW patient (P) or staff (T) label and assign
-                    # the red dets to it (use when no existing candidate fits).
-                    all_ids = {r['id'] for recs in per_frame_dets for r in recs}
-                    if k2 == 'p':
-                        pats = [i for i in all_ids if i < STAFF_ID_OFFSET]
-                        target = (max(pats) + 1) if pats else 1
+                # Sort reds by frame and split into temporal runs.
+                red_sorted = sorted(red_indices,
+                                    key=lambda j: fid_items[j][0])
+                runs = [[red_sorted[0]]]
+                for j in red_sorted[1:]:
+                    prev_f = fid_items[runs[-1][-1]][0]
+                    this_f = fid_items[j][0]
+                    if this_f - prev_f > RUN_GAP_FRAMES:
+                        runs.append([j])
                     else:
-                        stf = [i for i in all_ids
-                               if STAFF_ID_OFFSET <= i < STAFF_ID_OFFSET * 2]
-                        target = (max(stf) + 1) if stf else STAFF_ID_OFFSET
-                else:
-                    pick = int(k2) - 1
-                    if 0 <= pick < len(cand):
-                        target = cand[pick][0]
-                if target is None:
-                    continue
-                if k2 in ('p', 't'):
-                    official_ids.add(target)
-                # BBOX-precise: only the actually-red bbox(es) move, even
-                # if a frame has another det of the same id staying green.
-                n_moved = _relabel_dets_precise(
-                    per_frame_dets, fid_items, red_indices, fid, target)
-                f_min = min(f for f, _ in (fid_items[j] for j in red_indices))
-                f_max = max(f for f, _ in (fid_items[j] for j in red_indices))
-                done_ids.discard(fid)      # remaining part changed
-                done_ids.discard(target)   # target gained frames -> re-check
-                corrections += 1
-                logging.info(f"  {format_id(fid)}: {n_moved} dets rouges "
-                             f"(frames {f_min}-{f_max}) -> {format_id(target)}")
+                        runs[-1].append(j)
+                if len(runs) > 1:
+                    logging.info(f"  {format_id(fid)}: {len(runs)} plages "
+                                 f"rouges disjointes → un picker par plage.")
+
+                cancelled_runs = 0
+                for run_no, run_idx_list in enumerate(runs, start=1):
+                    sub_items = [fid_items[j] for j in run_idx_list]
+                    by_now = detections_by_final(per_frame_dets)
+                    ranked = rank_reassign_candidates(
+                        fid, sub_items, by_now, width, height, video_path,
+                        official_ids=official_ids)
+                    if not ranked:
+                        logging.info(f"  plage {run_no}/{len(runs)}: pas de "
+                                     f"candidat — laissée intacte.")
+                        cancelled_runs += 1
+                        continue
+                    cand = [(o, rep) for o, rep, _ov in ranked[:6]]
+                    o_strip = sample_filmstrip(sub_items, 6)
+                    f_first = sub_items[0][0]; f_last = sub_items[-1][0]
+                    run_progress = (f" (plage {run_no}/{len(runs)})"
+                                    if len(runs) > 1 else "")
+                    fig2 = render_reassign(
+                        fid, o_strip, cand, cap,
+                        f"Ré-assigner {format_id(fid)} f{f_first}-{f_last}"
+                        f"{run_progress}")
+                    k2 = _wait_key(
+                        fig2, set('s q 0 n p t 1 2 3 4 5 6'.split()))
+                    if k2 == 'q':
+                        quit_requested = True
+                        break
+                    if k2 in ('s', '0', 'n', None):
+                        cancelled_runs += 1
+                        continue
+                    target = None
+                    if k2 in ('p', 't'):
+                        all_ids = {r['id'] for recs in per_frame_dets
+                                   for r in recs}
+                        if k2 == 'p':
+                            pats = [i for i in all_ids if i < STAFF_ID_OFFSET]
+                            target = (max(pats) + 1) if pats else 1
+                        else:
+                            stf = [i for i in all_ids
+                                   if STAFF_ID_OFFSET <= i
+                                   < STAFF_ID_OFFSET * 2]
+                            target = ((max(stf) + 1) if stf
+                                      else STAFF_ID_OFFSET)
+                    else:
+                        pick = int(k2) - 1
+                        if 0 <= pick < len(cand):
+                            target = cand[pick][0]
+                    if target is None:
+                        cancelled_runs += 1
+                        continue
+                    if k2 in ('p', 't'):
+                        official_ids.add(target)
+                    n_moved = _relabel_dets_precise(
+                        per_frame_dets, fid_items, run_idx_list, fid,
+                        target)
+                    done_ids.discard(fid)
+                    done_ids.discard(target)
+                    corrections += 1
+                    logging.info(f"  {format_id(fid)}: plage f{f_first}-"
+                                 f"{f_last} ({n_moved} dets) -> "
+                                 f"{format_id(target)}")
+                if quit_requested:
+                    break
                 continue
 
         if quit_requested:

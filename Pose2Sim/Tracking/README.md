@@ -211,15 +211,22 @@ crop ─► DINOv2 base (frozen, 768-D)
 - Training de la tête : ~30 sec sur GPU (les features sont
   pré-extraites et cachées, on n'itère que sur des tenseurs).
 
-**Résultats sur Demo_Seance** (4 cams validées, 9 identités) :
-- Val accuracy random 80/20 : **0.985**
-- LOCO moyen (train sur 3 cams, test sur la 4ème jamais vue) :
-  **0.942** ; sur les identités effectivement présentes en train :
-  **0.997**.
-- Cosines inter-prototypes après training : **-0.4 à +0.16** (vs
-  0.84-0.94 avant) — les prototypes sont quasi orthogonaux.
-- Marge cosine correct (0.92) vs incorrect (0.19-0.67) ; un seuil
-  auto à 0.80 donne ~0 faux positif.
+**Résultats sur Demo_Seance** (9 identités) :
+
+| Métrique | v1 (4 cams) | v2 (8 cams) |
+|---|---|---|
+| Val accuracy (random 80/20) | 0.985 | 0.984 |
+| **LOCO moyen** (vrai test cross-cam) | **0.942** | **0.997** |
+| LOCO min sur un fold | 0.776 | 0.994 |
+| Cosines inter-prototypes | -0.4 à +0.16 | -0.4 à +0.3 |
+| Marge cosine correct vs incorrect | 0.92 vs 0.5-0.7 | 0.94 vs 0-0.85 |
+
+À 8 cams le LOCO atteint 99.7 % en moyenne sur ~8400 samples cumulés
+(~30 erreurs totales, 0.3 % de taux d'erreur). Les erreurs résiduelles
+sont presque toutes des confusions entre patients en blouse identique
+(P1↔P3, P2↔P5) — limite physiologique du re-ID visuel sur cette
+population. Un seuil auto à 0.70 absorbe tous ces cas sans faux
+positif notable.
 
 ### 4.4 Le classifier au runtime
 
@@ -574,8 +581,9 @@ ls "<trial>\tracking\*_validated.json"
 & "C:\ProgramData\anaconda3\envs\Pose2Sim_new\python.exe" `
   Pose2Sim\Tracking\_evaluate_classifier.py --mode leave_cam `
   --head "<trial>\tracking\arcface_head.pt"
-# Doit donner LOCO moyenne ~0.94 (min 0.77 — ce fold est dégénéré car
-# S3/S4 n'existent que dans la cam qu'on hold-out)
+# Avec 8 cams validées : LOCO moyenne ~0.997 (min ~0.99)
+# Avec 4 cams : LOCO moyenne ~0.94 (min 0.77 — fold dégénéré car S3/S4
+# n'existent que dans la cam hold-out)
 ```
 
 Les 4 cams restantes (22516499, 23859316, 23880904, 24710321) sont à

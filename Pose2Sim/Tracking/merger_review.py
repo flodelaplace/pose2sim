@@ -215,8 +215,67 @@ def build_group_summaries(per_frame_dets, id_to_final, video_path,
             'lifespan': last_frame - first_frame + 1,
             'n_detections': len(items),
             'original_ids': sorted({orig for _, _, orig in items}),
+            # Full (frame, bbox) sequence, kept so the classifier can be
+            # polled on N samples across the track and the scores
+            # AVERAGED — robust to occasional bad crops (motion blur,
+            # half-out-of-frame, occlusion) that would otherwise dominate
+            # a single repr_frame prediction.
+            'items': [(int(f), b) for f, b, _ in items],
         }
     return summaries
+
+
+def predict_track_aggregated(classifier, items, video_path, cap=None,
+                             n_samples=8):
+    '''
+    Aggregate the classifier's prediction over n_samples evenly-spaced
+    detections of a track and return the score-averaged ranking.
+
+    Why : single-frame prediction is brittle — a representative crop
+    chosen by `pick_representative_frame` can still be a poor sample
+    (motion blur, partial occlusion, edge of frame). Sampling 8 frames
+    and averaging the cosine sims per label gives a much more robust
+    confidence, so auto_founder / auto_newcomers don't reject 500-frame
+    tracks just because their first or middle crop was unlucky.
+
+    Items: iterable of (frame_idx, bbox) (extra fields ignored).
+    Returns ranked [(label, mean_score), ...] desc, or None.
+    '''
+    if classifier is None or not getattr(classifier, 'trained', False):
+        return None
+    items = [(int(it[0]), it[1]) for it in items]
+    items.sort(key=lambda x: x[0])
+    if not items:
+        return None
+    if len(items) > n_samples:
+        idx = np.linspace(0, len(items) - 1, n_samples).astype(int)
+        sampled = [items[int(i)] for i in idx]
+    else:
+        sampled = items
+    own_cap = False
+    if cap is None:
+        cap = cv2.VideoCapture(str(video_path))
+        own_cap = True
+    accum = {}
+    try:
+        for f_idx, bbox in sampled:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(f_idx))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            ranked = classifier.predict(frame, bbox)
+            if ranked is None:
+                continue
+            for label, score in ranked:
+                accum.setdefault(int(label), []).append(float(score))
+    finally:
+        if own_cap:
+            cap.release()
+    if not accum:
+        return None
+    means = [(lab, float(np.mean(sc))) for lab, sc in accum.items()]
+    means.sort(key=lambda x: -x[1])
+    return means
 
 
 def disable_mpl_default_keys():
@@ -572,9 +631,19 @@ def review_func(merged_json, output_json=None, output_mp4=None,
                 ok, frame = cap.read()
                 if not ok:
                     continue
-                ranked = (classifier.predict(frame,
-                                             f.get('repr_bbox', f['first_bbox']))
+                # Prediction AGGREGATED over 8 evenly-spaced frames of the
+                # founder track — robust to a poor repr_frame (motion
+                # blur, edge of frame, partial occlusion) that would
+                # otherwise tank the top-1 score and block auto mode.
+                ranked = (predict_track_aggregated(
+                            classifier, f.get('items', []),
+                            video_path, cap=cap, n_samples=8)
                           if classifier.trained else None)
+                if ranked is None and classifier.trained:
+                    # Fallback to single-frame on the very first cam (no
+                    # items list yet would be unusual but be safe).
+                    ranked = classifier.predict(
+                        frame, f.get('repr_bbox', f['first_bbox']))
                 # In cross-cam, surface ALL known classifier identities,
                 # not just the top-K. Otherwise a quiet S1 (= coach who
                 # rarely matches well at first glance) gets cut off and
@@ -755,54 +824,65 @@ def review_func(merged_json, output_json=None, output_mp4=None,
 
         # ---- Active-learning classifier prediction ----
         if classifier is not None and classifier.trained:
-            # Predict from newcomer's representative crop
-            cap.set(cv2.CAP_PROP_POS_FRAMES, newcomer.get('repr_frame',
-                                                          newcomer['first_frame']))
-            ok, frame = cap.read()
-            if ok:
-                ranked = classifier.predict(frame,
-                                            newcomer.get('repr_bbox',
-                                                         newcomer['first_bbox']))
-                if ranked is not None:
-                    prob_by_label = dict(ranked)
-                    for c in candidates:
-                        c['classifier_prob'] = prob_by_label.get(c['group']['tid'])
-                    # Cross-cam safety: surface every known classifier
-                    # identity as a "virtual" candidate, even if no local
-                    # track was mapped to it on this camera. Otherwise S1
-                    # (= coach known from a previous cam) is invisible
-                    # here and the user has no way to re-attach the
-                    # newcomer to it.
-                    existing_tids = {c['group']['tid'] for c in candidates}
-                    known_labels = {int(l) for l in classifier.y}
-                    for label in sorted(known_labels - existing_tids):
-                        virtual = {
-                            'tid': int(label),
-                            'first_frame': -1,
-                            'last_frame': newcomer['first_frame'] - 1,
-                            'first_center': (0.0, 0.0),
-                            'last_center': (0.0, 0.0),
-                            'first_bbox': [0.0, 0.0, 0.0, 0.0],
-                            'last_bbox': [0.0, 0.0, 0.0, 0.0],
-                            'repr_frame': -1,
-                            'repr_bbox': [0.0, 0.0, 0.0, 0.0],
-                            'exit_edge': 'middle',
-                            'entry_edge': 'middle',
-                            'embedding': None,
-                            'lifespan': 0,
-                            'is_virtual': True,
-                            'thumb': classifier.thumbnails.get(int(label)),
-                        }
-                        s = {'total': 0.0, 'appearance': 0.0,
-                             'spatial': 0.0, 'edge': 0.0, 'd_px': 0.0,
-                             'a_exit': 'middle',
-                             'b_entry': newcomer['entry_edge']}
-                        candidates.append({
-                            'group': virtual,
-                            'histo_score': 0.0,
-                            'detail': s,
-                            'classifier_prob': prob_by_label.get(int(label)),
-                        })
+            # AGGREGATED prediction over 8 evenly-spaced frames of the
+            # newcomer track. Single-frame predict on repr_frame was too
+            # brittle: a 500-frame track with one poor sample crop could
+            # produce a low top-1, block auto-newcomer, and force the
+            # user to handle a re-entry that the classifier actually has
+            # plenty of evidence for. Averaging the cosine sims across N
+            # samples per label gives a stable signal.
+            ranked = predict_track_aggregated(
+                classifier, newcomer.get('items', []),
+                video_path, cap=cap, n_samples=8)
+            if ranked is None:
+                # Fallback to legacy single-frame for safety.
+                cap.set(cv2.CAP_PROP_POS_FRAMES, newcomer.get(
+                    'repr_frame', newcomer['first_frame']))
+                ok, frame = cap.read()
+                if ok:
+                    ranked = classifier.predict(
+                        frame,
+                        newcomer.get('repr_bbox', newcomer['first_bbox']))
+            if ranked is not None:
+                prob_by_label = dict(ranked)
+                for c in candidates:
+                    c['classifier_prob'] = prob_by_label.get(c['group']['tid'])
+                # Cross-cam safety: surface every known classifier
+                # identity as a "virtual" candidate, even if no local
+                # track was mapped to it on this camera. Otherwise S1
+                # (= coach known from a previous cam) is invisible
+                # here and the user has no way to re-attach the
+                # newcomer to it.
+                existing_tids = {c['group']['tid'] for c in candidates}
+                known_labels = {int(l) for l in classifier.y}
+                for label in sorted(known_labels - existing_tids):
+                    virtual = {
+                        'tid': int(label),
+                        'first_frame': -1,
+                        'last_frame': newcomer['first_frame'] - 1,
+                        'first_center': (0.0, 0.0),
+                        'last_center': (0.0, 0.0),
+                        'first_bbox': [0.0, 0.0, 0.0, 0.0],
+                        'last_bbox': [0.0, 0.0, 0.0, 0.0],
+                        'repr_frame': -1,
+                        'repr_bbox': [0.0, 0.0, 0.0, 0.0],
+                        'exit_edge': 'middle',
+                        'entry_edge': 'middle',
+                        'embedding': None,
+                        'lifespan': 0,
+                        'is_virtual': True,
+                        'thumb': classifier.thumbnails.get(int(label)),
+                    }
+                    s = {'total': 0.0, 'appearance': 0.0,
+                         'spatial': 0.0, 'edge': 0.0, 'd_px': 0.0,
+                         'a_exit': 'middle',
+                         'b_entry': newcomer['entry_edge']}
+                    candidates.append({
+                        'group': virtual,
+                        'histo_score': 0.0,
+                        'detail': s,
+                        'classifier_prob': prob_by_label.get(int(label)),
+                    })
 
         # Rank: classifier confidence first if available + above threshold,
         # else fallback to histogram score.
@@ -892,7 +972,13 @@ def review_func(merged_json, output_json=None, output_mp4=None,
                              f"{format_id(chosen_tid_for_log)} "
                              f"(top {top_safe_score:.2f})")
             else:
-                key = 'n'
+                # Auto refused (low score or ambiguous). Previously we
+                # silently set key='n' which left the newcomer as a fresh
+                # fragment forever — so a 500-frame track for which the
+                # classifier just couldn't pick CONFIDENTLY would never
+                # get reattached to its real identity. Now we fall back
+                # to the manual popup so the user gets a chance to
+                # decide. They can still press N for "new".
                 if pick_idx is None:
                     if top_safe_score is None:
                         reason = "no non-overlapping candidate"
@@ -905,8 +991,22 @@ def review_func(merged_json, output_json=None, output_mp4=None,
                               f"{format_id(other_tid)} {other_score:.2f} "
                               f"(margin {top_safe_score - other_score:.2f} < "
                               f"{auto_margin:.2f})")
-                logging.info(f"  AUTO: {format_id(newcomer['tid'])} -> "
-                             f"NEW ({reason})")
+                logging.info(f"  AUTO-REFUSE → manual popup pour "
+                             f"{format_id(newcomer['tid'])} ({reason})")
+                fig = render_picker_figure(newcomer, candidates, cap, fps,
+                                           n_frames, progress)
+                decision = {'key': None}
+
+                def on_key(event, _decision=decision, _fig=fig):
+                    k = (event.key or '').lower()
+                    if (k in ('q', 's', 'n', 'p', 't')
+                            or (k.isdigit() and k in '0123456789')):
+                        _decision['key'] = k
+                        plt.close(_fig)
+
+                fig.canvas.mpl_connect('key_press_event', on_key)
+                plt.show()
+                key = decision['key'] or 'n'
         else:
             fig = render_picker_figure(newcomer, candidates, cap, fps,
                                        n_frames, progress)

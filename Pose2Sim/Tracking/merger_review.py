@@ -652,23 +652,34 @@ def review_func(merged_json, output_json=None, output_mp4=None,
                 top_K = ranked[:effective_max] if ranked else []
 
                 # ---- Auto-founder mode ----
-                # If --auto_founder is set AND the classifier's top-1
-                # cosine sim is above the threshold AND clearly beats
-                # top-2 (margin), accept the prediction without opening
-                # the manual popup. Falls back to manual otherwise so the
-                # ambiguous cases stay user-controlled.
-                if (auto_founder_thresh is not None and top_K
-                        and top_K[0][1] >= auto_founder_thresh
-                        and (len(top_K) == 1
-                             or top_K[0][1] - top_K[1][1] >= auto_margin)):
-                    auto_label = int(top_K[0][0])
-                    if auto_label not in (founder_picks.values()):
-                        founder_picks[f['tid']] = auto_label
-                        logging.info(
-                            f"  Founder {fi}/{len(founders)} T{f['tid']} "
-                            f"-> AUTO {format_id(auto_label)} "
-                            f"(cosine {top_K[0][1]:.2f})")
-                        continue
+                # Two paths into auto-accept:
+                #   A) STRICT confident — top-1 cosine ≥ auto_founder_thresh
+                #      AND top-1 beats top-2 by at least auto_margin.
+                #   B) DECISIVE — top-1 cosine ≥ MIN_AUTO_SCORE (0.40, just
+                #      to filter pure noise) AND top-1 - top-2 ≥ 2*auto_margin
+                #      (the model is unambiguous about WHICH identity even
+                #      if absolute score is modest, typical of a new view
+                #      angle where the embedding doesn't fully tap the
+                #      prototype but the next-best is way further).
+                # Falls back to manual popup otherwise.
+                if auto_founder_thresh is not None and top_K:
+                    top1 = top_K[0][1]
+                    top2 = top_K[1][1] if len(top_K) > 1 else 0.0
+                    margin = top1 - top2
+                    strict = (top1 >= auto_founder_thresh
+                              and margin >= auto_margin)
+                    decisive = (top1 >= 0.40 and margin >= 2 * auto_margin)
+                    if strict or decisive:
+                        auto_label = int(top_K[0][0])
+                        if auto_label not in (founder_picks.values()):
+                            founder_picks[f['tid']] = auto_label
+                            mode = "STRICT" if strict else "DECISIVE"
+                            logging.info(
+                                f"  Founder {fi}/{len(founders)} "
+                                f"T{f['tid']} -> AUTO {format_id(auto_label)} "
+                                f"({mode}: top1 {top1:.2f}, "
+                                f"margin {margin:.2f})")
+                            continue
                 progress = (f"Founder {fi}/{len(founders)}  local T{f['tid']}  "
                             f"frame {f['first_frame']}")
                 fig = render_founder_mapping_figure(
@@ -930,11 +941,13 @@ def review_func(merged_json, output_json=None, output_mp4=None,
                     f"({len(candidates)} cands)")
 
         # Auto-newcomer mode: skip the popup and pick the highest-ranked
-        # NON-OVERLAPPING candidate iff (a) its score >= threshold AND
-        # (b) it's clearly ahead of the next-best candidate by `auto_margin`.
-        # The overlap filter prevents fusing two coexisting persons; the
-        # margin guard prevents accepting an ambiguous classifier guess
-        # (e.g., S1=0.65, P3=0.60 — the model is hesitating, don't force).
+        # NON-OVERLAPPING candidate via one of two paths:
+        #   A) STRICT — top-1 score >= auto_newcomers_thresh AND
+        #      margin (top-1 - top-2) >= auto_margin.
+        #   B) DECISIVE — top-1 >= MIN_AUTO_SCORE (0.40, noise floor) AND
+        #      margin >= 2 * auto_margin. Covers the typical "new view
+        #      angle" case: top-1 around 0.65 vs top-2 around 0.20 is
+        #      unambiguous, even though 0.65 < 0.80 strict threshold.
         if auto_newcomers_thresh is not None:
             pick_idx = None
             top_safe_score = None
@@ -943,54 +956,56 @@ def review_func(merged_json, output_json=None, output_mp4=None,
                            or group.get('last_frame', -1) < newcomer['first_frame'])
                 if is_safe:
                     top_safe_score = score
-                    if score >= auto_newcomers_thresh:
-                        pick_idx = i
+                    pick_idx = i
                     break
 
-            # Margin check: gap between top-1 (= the safe pick) and the
-            # next candidate of a DIFFERENT identity. We compare against
-            # any other candidate (safe or not) because if the classifier
-            # ranks two different people closely, the choice is ambiguous.
+            # Find the top score of any OTHER identity (safe or not) to
+            # compute the margin. Ambiguity between two different people
+            # blocks auto regardless of the path.
             margin_ok = True
             margin_blocker = None
+            top2_score = 0.0
             if pick_idx is not None:
                 picked_tid = candidates[pick_idx][1]['tid']
                 for j, (other_score, other_group, _) in enumerate(candidates):
                     if j == pick_idx:
                         continue
                     if other_group['tid'] == picked_tid:
-                        continue  # same identity (shouldn't happen, safety)
-                    if top_safe_score - other_score < auto_margin:
-                        margin_ok = False
-                        margin_blocker = (other_group['tid'], other_score)
-                    break  # only check against the next-best
+                        continue
+                    top2_score = other_score
+                    break
+            margin = (top_safe_score - top2_score) if top_safe_score is not None else 0.0
 
-            if pick_idx is not None and margin_ok:
+            # Two auto-accept paths.
+            strict = (top_safe_score is not None
+                      and top_safe_score >= auto_newcomers_thresh
+                      and margin >= auto_margin)
+            decisive = (top_safe_score is not None
+                        and top_safe_score >= 0.40
+                        and margin >= 2 * auto_margin)
+
+            if pick_idx is not None and (strict or decisive):
                 key = str(pick_idx + 1)
                 chosen_tid_for_log = candidates[pick_idx][1]['tid']
-                logging.info(f"  AUTO: {format_id(newcomer['tid'])} -> "
+                mode = "STRICT" if strict else "DECISIVE"
+                logging.info(f"  AUTO ({mode}): "
+                             f"{format_id(newcomer['tid'])} -> "
                              f"{format_id(chosen_tid_for_log)} "
-                             f"(top {top_safe_score:.2f})")
+                             f"(top {top_safe_score:.2f}, "
+                             f"margin {margin:.2f})")
             else:
-                # Auto refused (low score or ambiguous). Previously we
-                # silently set key='n' which left the newcomer as a fresh
-                # fragment forever — so a 500-frame track for which the
-                # classifier just couldn't pick CONFIDENTLY would never
-                # get reattached to its real identity. Now we fall back
-                # to the manual popup so the user gets a chance to
-                # decide. They can still press N for "new".
-                if pick_idx is None:
-                    if top_safe_score is None:
-                        reason = "no non-overlapping candidate"
-                    else:
-                        reason = (f"top safe {top_safe_score:.2f} < "
-                                  f"threshold {auto_newcomers_thresh:.2f}")
+                # Auto refused. Fall back to manual popup so the user
+                # gets a chance to decide — silently labeling 'n' would
+                # strand a long track as an orphan fragment.
+                if top_safe_score is None:
+                    reason = "no non-overlapping candidate"
+                elif top_safe_score < 0.40:
+                    reason = (f"top {top_safe_score:.2f} < 0.40 noise floor")
                 else:
-                    other_tid, other_score = margin_blocker
-                    reason = (f"ambiguous: top {top_safe_score:.2f} vs "
-                              f"{format_id(other_tid)} {other_score:.2f} "
-                              f"(margin {top_safe_score - other_score:.2f} < "
-                              f"{auto_margin:.2f})")
+                    reason = (f"top {top_safe_score:.2f} "
+                              f"(strict needs ≥{auto_newcomers_thresh:.2f}), "
+                              f"margin {margin:.2f} "
+                              f"(decisive needs ≥{2*auto_margin:.2f})")
                 logging.info(f"  AUTO-REFUSE → manual popup pour "
                              f"{format_id(newcomer['tid'])} ({reason})")
                 fig = render_picker_figure(newcomer, candidates, cap, fps,

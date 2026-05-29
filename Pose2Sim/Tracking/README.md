@@ -14,20 +14,22 @@ spécifiquement pour la session en cours.
 Si tu reprends ce code, lis dans cet ordre :
 
 1. **§1** (vue d'ensemble) — comprends les 8 stages.
-2. **§4** (ML technique) — l'architecture re-ID et pourquoi elle est ce
+2. **§2** (prérequis) — ce module ne fait PAS la détection 2D : il faut
+   avoir déjà tourné `Pose2Sim --poseEstimation` pour générer les JSON.
+3. **§5** (ML technique) — l'architecture re-ID et pourquoi elle est ce
    qu'elle est. Comme tu fais du stats/ML, tu y verras les arbitrages.
-3. **§5 et §6** (les deux GUI : founder+newcomer review, puis scrubber
+4. **§6 et §7** (les deux GUI : founder+newcomer review, puis scrubber
    de validation) — c'est là que se passe l'interaction humaine.
-4. **§7** — déroulé complet d'une session (8 cams), ordre des commandes,
+5. **§8** — déroulé complet d'une session (8 cams), ordre des commandes,
    et le fine-tune ArcFace qui est le saut qualitatif principal.
-5. **§9** (référence fichier par fichier) en cas de doute sur où vit
+6. **§10** (référence fichier par fichier) en cas de doute sur où vit
    telle fonction.
 
 Le contexte clinique : **Demo_Seance** = 8 caméras Sony synchronisées,
 ~2760 frames, ~6 patients en blouse identique + 1-4 staff (coach,
 physio, soignants). La difficulté ML majeure est que les patients
 visuellement très similaires se ressemblent à 90 % en cosine DINOv2
-zero-shot — le pivot ArcFace (§4.3) règle ça.
+zero-shot — le pivot ArcFace (§5.3) règle ça.
 
 ---
 
@@ -74,7 +76,41 @@ humaines pour assister les cams suivantes.
 
 ---
 
-## 2. Installation et environnement
+## 2. Prérequis — ce qui doit déjà exister
+
+Ce module **ne fait pas la détection 2D** — il prend en entrée les bboxes
+déjà produites par la `poseEstimation` standard de Pose2Sim (RTMPose +
+détecteur de personnes). Donc avant de lancer quoi que ce soit ici, il
+faut avoir, pour chaque caméra :
+
+```
+<trial>/pose/<cam>_json/          # 1 JSON par frame, contient "bbox" + keypoints
+<trial>/videos/<cam>.mp4          # la vidéo synchronisée
+```
+
+Si tu n'as que les vidéos, lance d'abord :
+```bash
+python -m Pose2Sim --poseEstimation     # ou via l'API Pose2Sim.poseEstimation()
+```
+
+**Détecteur de personnes — flexible.** Pose2Sim fournit un YOLO par
+défaut, mais ce module n'a aucune dépendance directe à un détecteur
+spécifique : il ne lit que `bbox` dans les JSON. Si tu veux un détecteur
+plus récent / plus précis (YOLOv11, RT-DETR, ...) :
+
+- intègre-le côté `poseEstimation` (c'est là que les bboxes sont
+  produites avant le keypoint detection),
+- ou pré-génère les JSON avec ton détecteur en respectant le format
+  Pose2Sim (`{"image_id", "category_id", "keypoints", "bbox":[x,y,w,h]
+  ou [x1,y1,x2,y2]}`).
+
+Les bboxes plus serrées / mieux NMS-filtrées **amélioreront tout le
+reste** du pipeline (moins de duplicates intra-frame, founder mapping
+plus propre, training avec moins d'outliers couleur écartés).
+
+---
+
+## 3. Installation et environnement
 
 ```bash
 conda activate Pose2Sim_new
@@ -106,7 +142,7 @@ Le conflit OpenMP Windows (`libiomp5md.dll`) est géré
 
 ---
 
-## 3. Structure des sorties d'une session
+## 4. Structure des sorties d'une session
 
 ```
 <trial>/tracking/
@@ -132,9 +168,9 @@ si on devait redistribuer les labels.
 
 ---
 
-## 4. Le côté ML — l'architecture re-ID
+## 5. Le côté ML — l'architecture re-ID
 
-### 4.1 Pourquoi un MLP softmax ne suffit pas
+### 5.1 Pourquoi un MLP softmax ne suffit pas
 
 L'approche naïve (et celle implémentée initialement) : extraire un
 embedding par crop (DINOv2 768-D + histogramme couleur torse 30-D +
@@ -153,7 +189,7 @@ caméra. Pourquoi :
 LOCO test (leave-one-camera-out) : **54 % accuracy moyenne**. Pour les
 besoins d'auto-mode il faut > 90 %.
 
-### 4.2 Prototype matching (étape intermédiaire)
+### 5.2 Prototype matching (étape intermédiaire)
 
 Premier vrai fix : remplacer le MLP par un **prototype par identité** =
 moyenne L2-normalisée des embeddings backbone L2-normalisés. La
@@ -170,7 +206,7 @@ dans l'espace DINOv2 zero-shot. La structure géométrique du backbone
 n'a tout simplement pas la résolution pour séparer ces patients. Donc
 prototype-matching seul = même limitation que le MLP.
 
-### 4.3 Le pivot — fine-tune ArcFace de la tête de projection
+### 5.3 Le pivot — fine-tune ArcFace de la tête de projection
 
 L'ingrédient manquant : apprendre **explicitement** au modèle à
 discriminer les identités de la session. Schéma :
@@ -228,7 +264,7 @@ sont presque toutes des confusions entre patients en blouse identique
 population. Un seuil auto à 0.70 absorbe tous ces cas sans faux
 positif notable.
 
-### 4.4 Le classifier au runtime
+### 5.4 Le classifier au runtime
 
 À l'inférence (founder mapping, newcomer review, eval) :
 
@@ -241,7 +277,7 @@ positif notable.
 Le `trial_classifier.pkl` sauvegarde `X, y, head_path, backbone, ...` :
 une fois trained, le pkl est self-contained — recharger suffit.
 
-### 4.5 Évaluation (`_evaluate_classifier.py`)
+### 5.5 Évaluation (`_evaluate_classifier.py`)
 
 Trois modes :
 
@@ -262,9 +298,9 @@ python Pose2Sim/Tracking/_evaluate_classifier.py --mode leave_cam \
 
 ---
 
-## 5. GUI 1 — Stage 6 : founder + newcomer review (`merger_review`)
+## 6. GUI 1 — Stage 6 : founder + newcomer review (`merger_review`)
 
-### 5.1 Phase founder mapping (manuelle à froid, assistée ensuite)
+### 6.1 Phase founder mapping (manuelle à froid, assistée ensuite)
 
 Au début de chaque cam, pour chaque track candidat founder (= visible
 dans la fenêtre `[founding_start, founding_start + 60]`) :
@@ -286,7 +322,7 @@ top-K candidats (avec leurs vignettes représentatives) — généralement
 prédiction a cosine ≥ 0.80 ET marge ≥ 0.15 avec top-2. Fallback
 manuel pour les cas ambigus.
 
-### 5.2 Phase newcomer review
+### 6.2 Phase newcomer review
 
 Pour chaque track qui apparaît après la fenêtre founder (= une
 ré-entrée d'un founder, OU une vraie nouvelle personne) :
@@ -302,7 +338,7 @@ ré-entrée d'un founder, OU une vraie nouvelle personne) :
 `--auto_newcomers 0.80` : même logique que auto_founder pour cette
 phase.
 
-### 5.3 Sortie
+### 6.3 Sortie
 
 `<cam>_final.json` contient :
 - `id_to_final` : mapping **raw_track_id → final_label**. Le re-keying
@@ -317,13 +353,13 @@ phase.
 
 ---
 
-## 6. GUI 2 — Stage 7 : scrubber de validation (`validate_review`)
+## 7. GUI 2 — Stage 7 : scrubber de validation (`validate_review`)
 
 C'est **la** vérité-terrain. Un humain valide frame par frame que
 chaque identité contient bien la bonne personne et rien que la bonne
 personne.
 
-### 6.1 Workflow par identité
+### 7.1 Workflow par identité
 
 - Pré-extraction séquentielle de tous les crops bbox en JPEG RAM
   (~20 KB/crop, ~150 MB max pour un track de 2000 frames). Scrubbing
@@ -337,7 +373,7 @@ personne.
 - Une **timeline tri-state en bas** montre d'un coup d'œil quelles
   frames sont vert/rouge/gris/mixte.
 
-### 6.2 Touches essentielles
+### 7.2 Touches essentielles
 
 | Touche | Action |
 |---|---|
@@ -350,7 +386,7 @@ personne.
 | `S` | Identité entière indéterminée |
 | `Q` | Quitter |
 
-### 6.3 Raccourcis avancés (longues plages d'impostor)
+### 7.3 Raccourcis avancés (longues plages d'impostor)
 
 | Touche | Action |
 |---|---|
@@ -366,7 +402,7 @@ slot count de la frame courante) — donc tu peux Tab sur le slot 1, B
 au début d'un run d'impostor, naviguer 200 frames en avant, E, et tout
 le slot-1 de la plage est marqué rouge. Le slot 0 reste intact.
 
-### 6.4 Mécanique R bbox-précise
+### 7.4 Mécanique R bbox-précise
 
 Quand tu fais R, on relabelise **exactement les bboxes rouges**
 (match par `id(bbox)` Python d'abord, valeur en fallback). Donc 2
@@ -378,7 +414,7 @@ Le picker (touche R) ne propose **QUE** les `official_ids` issus du
 stage 6 + les P/T créés en review (jamais les fragments). C'est ce
 qui garantit que tu ne disperses pas une identité dans des fragments.
 
-### 6.5 Sentinelle indéterminé
+### 7.5 Sentinelle indéterminé
 
 Les dets marquées gris sont relabelisées à
 `INDETERMINATE_LABEL = 8_888_888`, et cet id est automatiquement
@@ -387,7 +423,7 @@ stage 8 voit ce label dans la liste exclude et passe son chemin.
 
 ---
 
-## 7. Workflow complet d'une session
+## 8. Workflow complet d'une session
 
 Pour 8 caméras, voici l'ordre et les commandes (les `<...>` à
 remplacer).
@@ -473,7 +509,7 @@ après cette cam pour intégrer le nouveau staff dans la tête.
 
 ---
 
-## 8. Référence des flags principaux
+## 9. Référence des flags principaux
 
 | Flag | Défaut | Rôle |
 |---|---|---|
@@ -499,7 +535,7 @@ après cette cam pour intégrer le nouveau staff dans la tête.
 
 ---
 
-## 9. Référence fichier par fichier
+## 10. Référence fichier par fichier
 
 | Fichier | Rôle | Lignes critiques |
 |---|---|---|
@@ -523,7 +559,7 @@ pour debug, ou via le pipeline.
 
 ---
 
-## 10. Limites connues et pistes futures
+## 11. Limites connues et pistes futures
 
 - **Identités quasi indistinguables** (ex. 3 patients en blouse noire
   identique, vus de loin). Après ArcFace fine-tune sur 4 cams le LOCO
@@ -562,7 +598,7 @@ pour debug, ou via le pipeline.
 
 ---
 
-## 11. Reproduire les résultats Demo_Seance
+## 12. Reproduire les résultats Demo_Seance
 
 Pour vérifier que le code fonctionne sur Demo_Seance (8 cams,
 ~6 patients + 4 staff, 2760 frames chacune) après reprise :

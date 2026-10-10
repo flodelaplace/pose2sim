@@ -977,7 +977,7 @@ For a more automatic calibration, you can calibrate your cameras just by walking
 - Copy your videos into the `calibration/extrinsics` folder, one per camera (as for the other methods: in one subfolder per camera, or directly in the folder).
 - Run `Pose2Sim.calibration()`.
 
-The calibration is in meters, gravity-aligned (Z up), with its origin on the floor under the participant. In `[calibration.calculate.extrinsics.keypoints]`, `pose_engine = 'rtmpose'` uses the RTMPose models already installed with Pose2Sim instead (`pip install "humancalib[rtmpose]"`), but it fails more often. Evaluated against the laboratory calibrations of five public datasets (77 trials): median relative rotation error between cameras of 0.95°, no failed calibration, and joint angles from the Pose2Sim chain within about half a degree of those obtained with the laboratory calibration.
+The calibration is in meters, gravity-aligned (Z up), with its origin on the floor under the participant. In `[calibration.calculate.extrinsics.keypoints]`, `pose_engine = 'rtmpose'` uses the RTMPose models already installed with Pose2Sim instead (`pip install "humancalib[rtmpose]"`), slightly less accurate, with one failed calibration out of 77 trials (none with MeTRAbs). Evaluated against the laboratory calibrations of five public datasets (77 trials): median relative rotation error between cameras of 0.95°, no failed calibration, and joint angles from the Pose2Sim chain within about half a degree of those obtained with the laboratory calibration.
 
 > [!TIP]
 > - Much simpler than any of the other methods, but

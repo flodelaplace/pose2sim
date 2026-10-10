@@ -199,7 +199,7 @@ calibration_type = 'convert' # 'convert' or 'calculate'
          # pip install "humancalib[gpu]" (MeTRAbs), or "humancalib[rtmpose]" for pose_engine = 'rtmpose'.
          # The metric scale comes from [project] participant_height, which must be a number here (e.g. 1.72).
          # The calibration is gravity-aligned: Z up, origin on the floor under the participant's heels.
-         pose_engine = 'metrabs' # 'metrabs' (recommended: no failure on 77 evaluation trials) or 'rtmpose' (no extra model, less robust)
+         pose_engine = 'metrabs' # 'metrabs' (recommended: no failure on 77 evaluation trials) or 'rtmpose' (uses the RTMPose models installed with Pose2Sim; slightly less accurate, 1 failure on 77 trials)
          frame_budget = 100 # about how many frames the calibration uses; 30 to 60 already give the full accuracy
          extract_fps = 'auto' # 'auto': pose estimation at ~25 Hz on videos faster than 50 Hz (same accuracy, faster), a number, or false
 
